@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Arm Simulator</title>
+  <meta name="description" content="Browser-based articulated arm simulator: load any URDF, drive it in joint or Cartesian space, and teach waypoint programs.">
+  <meta name="color-scheme" content="light dark">
+  <script>
+    // Apply the saved theme before first paint (light by default).
+    try { if (localStorage.getItem('urdf-arm-sim:theme') === 'dark') document.documentElement.dataset.theme = 'dark'; } catch (e) {}
+  </script>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2314181e'/%3E%3Cpath d='M7 25h10M12 25v-6l6-7 6 3' stroke='%233fd7ff' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='12' cy='19' r='2.2' fill='%23ffa23d'/%3E%3Ccircle cx='18' cy='12' r='2.2' fill='%23ffa23d'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/style.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" width="22" height="22" aria-hidden="true"><path d="M7 25h10M12 25v-6l6-7 6 3" stroke="currentColor" stroke-width="2.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="19" r="2.2" fill="var(--accent-2)"/><circle cx="18" cy="12" r="2.2" fill="var(--accent-2)"/></svg>
+      <span>Arm Simulator</span>
+    </div>
+    <label class="robot-picker">
+      <span class="sr-only">Robot</span>
+      <select id="robot-select" aria-label="Robot"><option>Loading…</option></select>
+    </label>
+    <div class="top-actions">
+      <button class="btn" id="btn-open-files" type="button" title="Open a .urdf with its mesh files, or a .zip">Open files</button>
+      <button class="btn" id="btn-open-folder" type="button" title="Open a robot package folder">Open folder</button>
+      <button class="btn" id="btn-open-url" type="button" title="Load a URDF from a URL">URL</button>
+      <button class="icon-btn" id="btn-theme" type="button" title="Switch light / dark theme" aria-label="Switch light or dark theme"><span class="theme-icon-light" aria-hidden="true">☾</span><span class="theme-icon-dark" aria-hidden="true">☀</span></button>
+      <button class="icon-btn" id="btn-help" type="button" title="Help and shortcuts" aria-label="Help">?</button>
+    </div>
+    <input type="file" id="file-input" multiple hidden accept=".urdf,.xml,.zip,.stl,.STL,.dae,.DAE,.obj,.glb,.gltf,.bin,.ply,.png,.jpg,.jpeg,.tga,.mtl">
+    <input type="file" id="folder-input" multiple hidden webkitdirectory directory>
+  </header>
+
+  <main class="layout">
+    <section class="viewport" id="viewport" aria-label="3D view">
+      <div class="view-toolbar" role="toolbar" aria-label="Display options">
+        <button type="button" data-view="visual" aria-pressed="true" title="Visual meshes">Visual</button>
+        <button type="button" data-view="collision" aria-pressed="false" title="Collision geometry">Collision</button>
+        <button type="button" data-view="frames" aria-pressed="false" title="Link frames">Frames</button>
+        <button type="button" data-view="axes" aria-pressed="false" title="Joint axes">Axes</button>
+        <button type="button" data-view="skeleton" aria-pressed="false" title="Kinematic skeleton">Skeleton</button>
+        <button type="button" data-view="tcp" aria-pressed="true" title="TCP frame (always shown in Cartesian mode)">TCP</button>
+        <button type="button" data-view="points" aria-pressed="true" title="Program points and path">Points</button>
+        <button type="button" data-view="grid" aria-pressed="true" title="Ground grid">Grid</button>
+        <button type="button" id="btn-fit" title="Fit view (F)">Fit</button>
+      </div>
+      <div class="hud" id="hud" hidden></div>
+      <div class="loading" id="loading" hidden><div class="spinner" aria-hidden="true"></div><span class="loading-text">Loading…</span></div>
+      <div class="drop-overlay" id="drop-overlay" hidden><div>Drop a .urdf with its meshes, a package folder, or a .zip</div></div>
+    </section>
+
+    <aside class="panel" id="panel" aria-label="Controls">
+      <section class="card robot-card" id="robot-card"><p class="muted">Loading robot…</p></section>
+
+      <div class="mode-switch" role="tablist" aria-label="Control mode">
+        <button type="button" role="tab" data-mode="joint" aria-selected="true">Joint <kbd>J</kbd></button>
+        <button type="button" role="tab" data-mode="cartesian" aria-selected="false">Cartesian <kbd>C</kbd></button>
+      </div>
+
+      <section class="card" id="joint-panel"></section>
+      <section class="card" id="cartesian-panel" hidden></section>
+      <section class="card readout" id="joint-readout" hidden></section>
+      <section class="card" id="program-panel"></section>
+
+      <footer class="foot muted">
+        UR10 model: <a href="https://github.com/UniversalRobots/Universal_Robots_ROS2_Description" target="_blank" rel="noopener">Universal Robots ROS 2 description</a> (BSD-3-Clause).
+      </footer>
+    </aside>
+  </main>
+
+  <dialog id="dialog"></dialog>
+  <div id="toasts" aria-live="polite"></div>
+
+  <noscript><p style="padding:16px">This simulator needs JavaScript and WebGL.</p></noscript>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
