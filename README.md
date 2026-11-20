@@ -96,11 +96,14 @@ ES modules don't load from `file://`, so serve the folder:
 ```sh
 npm install        # dev-only: three (for tests), xmldom, puppeteer-core
 npm run serve      # http://localhost:8080
-npm test           # kinematics tests (FK vs. UR10 DH table, Jacobian, IK)
+npm test           # kinematics (FK vs. UR10 DH table, Jacobian, IK) and URDF parser tests
 npm run e2e -- --fanuc <path-to-another-urdf-package>   # headless Chrome/Edge smoke test
+node tests/e2e/run-multi.mjs robots.json               # load many robot packages and check each end to end
 ```
 
-`npm run serve` needs only Node, with no dependencies. Any static server works too, e.g. `python -m http.server`.
+`run-multi.mjs` takes a manifest such as `{ "robots": [ { "name": "panda", "dir": "/path/to/panda_description", "urdf": "urdf/panda.urdf", "expectTip": "panda_hand_tcp" } ] }`. For each robot it checks the joint count, missing meshes, mesh orientation, IK on random reachable poses, and a MoveJ + MoveL program.
+
+`npm run serve` needs only Node, with no dependencies. It listens on 127.0.0.1; set `HOST=0.0.0.0` to open it to other devices, e.g. a phone, on your network. Any static server works too, e.g. `python -m http.server`.
 
 ## Project layout
 

@@ -85,6 +85,17 @@ export class KinematicChain {
     this.isAngular = this.variables.map((j) => j.type !== 'prismatic');
 
     // Scratch.
+    // A variable is 2π-periodic only if every joint it drives (mimic followers anywhere
+    // in the model) is angular with an integer multiplier; otherwise q and q ± 2π differ.
+    this.periodic = this.variables.map((v) => {
+      if (v.type === 'prismatic') return false;
+      for (const j of model.joints.values()) {
+        const m = j.mimicResolved;
+        if (m && m.master === v.name && (j.type === 'prismatic' || !Number.isInteger(m.multiplier))) return false;
+      }
+      return true;
+    });
+
     this._frames = this.elements.map(() => new Matrix4());
     this._m = new Matrix4();
     this._axis = new Vector3();

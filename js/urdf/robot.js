@@ -335,6 +335,13 @@ export function defaultTipLink(model) {
     visit(model.root, 0, 0);
     const maxD = Math.max(...info.map((x) => x.dof));
     if (maxD === 0) return null;
+    // An exactly named tool frame (tool0, tcp, ...) one joint short of the deepest
+    // link wins: that last joint is almost certainly an unrecognised gripper joint.
+    const exact = info.filter((x) => x.dof >= maxD - 1 && x.dof > 0 && PREFERRED_TIPS.slice(0, 4).includes(x.name.toLowerCase()));
+    if (exact.length) {
+      exact.sort((a, b) => b.dof - a.dof || score(b.name, b.depth) - score(a.name, a.depth));
+      return exact[0].name;
+    }
     let best = null;
     for (const x of info) {
       if (x.dof !== maxD) continue;

@@ -145,16 +145,38 @@ export function parseURDF(text, opts = {}) {
   const warnings = [];
   const warn = (msg) => warnings.push(msg);
 
-  let doc;
-  try {
-    doc = new DP().parseFromString(text, 'application/xml');
-  } catch (e) {
-    throw new URDFParseError(`XML parse error: ${e.message}`);
+  // urdfdom (TinyXML2) tolerates leading whitespace/BOM before <?xml and ignores
+  // namespaces; browsers' DOMParser does neither.
+  text = String(text).replace(/^[\s﻿]+/, '');
+  const parseXml = (src) => {
+    let d;
+    try {
+      d = new DP().parseFromString(src, 'application/xml');
+    } catch (e) {
+      return { error: e.message };
+    }
+    const pe = d.getElementsByTagName('parsererror');
+    return pe.length ? { error: (pe[0].textContent || '').trim().split('\n')[0] } : { doc: d };
+  };
+  let parsed = parseXml(text);
+  if (parsed.error && /prefix|namespace|unbound/i.test(parsed.error)) {
+    // Declare undeclared prefixes (e.g. <sensor:camera> inside <gazebo>) on <robot> and retry.
+    const robotTag = (/<robot\b[^>]*>/.exec(text) || [''])[0];
+    const declared = new Set([...robotTag.matchAll(/xmlns:([\w.-]+)\s*=/g)].map((m) => m[1]));
+    const prefixes = new Set();
+    for (const m of text.matchAll(/<\/?([A-Za-z_][\w.-]*):/g)) prefixes.add(m[1]);
+    for (const m of text.matchAll(/\s([A-Za-z_][\w.-]*):[\w.-]+\s*=/g)) prefixes.add(m[1]);
+    const add = [...prefixes].filter((p) => p !== 'xml' && p !== 'xmlns' && !declared.has(p));
+    if (add.length) {
+      const patched = text.replace(/<robot\b/, `<robot ${add.map((p) => `xmlns:${p}="urn:urdf-undeclared:${p}"`).join(' ')}`);
+      const retry = parseXml(patched);
+      if (!retry.error) parsed = retry;
+    }
   }
-  const perr = doc.getElementsByTagName('parsererror');
-  if (perr.length) {
-    throw new URDFParseError(`XML parse error: ${(perr[0].textContent || '').trim().split('\n')[0]}`);
-  }
+  if (parsed.error) throw new URDFParseError(`XML parse error: ${parsed.error}`);
+  const doc = parsed.doc;
+  // Heuristics below must not see comments (xacro output keeps commented-out xacro tags).
+  const code = text.replace(/<!--[\s\S]*?-->/g, '');
 
   // Root may be <robot>, or the file may wrap it (rare). Take the first <robot>.
   let robotEl = doc.documentElement;
@@ -169,9 +191,9 @@ export function parseURDF(text, opts = {}) {
     throw new URDFParseError('No <robot> element found — is this a URDF file?');
   }
 
-  const isXacro = looksLikeXacro(doc, text);
+  const isXacro = looksLikeXacro(doc, code);
   if (isXacro) {
-    const hasMacros = /<xacro:(macro|include|property|if|unless|call)\b/.test(text);
+    const hasMacros = /<xacro:(macro|include|property|if|unless|call)\b/.test(code);
     if (hasMacros || elementChildren(robotEl, 'link').length === 0) {
       throw new URDFParseError(
         'This file is xacro, not plain URDF. Expand it first:  xacro robot.urdf.xacro > robot.urdf  ' +
@@ -222,15 +244,18 @@ export function parseURDF(text, opts = {}) {
         if (tag === 'visual') {
           const mEl = firstChild(v, 'material');
           if (mEl) {
+            // urdfdom semantics: a named material already in the table wins over inline
+            // values; a named inline definition is added to the table (first one wins).
             const local = parseMaterialEl(mEl, warn, `${what} material`);
-            const global = local.name ? model.materials.get(local.name) : null;
-            material = {
-              name: local.name,
-              color: local.color || (global && global.color) || null,
-              texture: local.texture || (global && global.texture) || null,
-            };
-            if (!local.color && !local.texture && local.name && !global) {
-              warn(`${what}: material "${local.name}" is not defined; using default color`);
+            if (local.name && model.materials.has(local.name)) {
+              const g = model.materials.get(local.name);
+              material = { name: g.name, color: g.color, texture: g.texture };
+            } else if (local.color || local.texture) {
+              material = local;
+              if (local.name) model.materials.set(local.name, local);
+            } else {
+              material = { name: local.name, color: null, texture: null };
+              if (local.name) warn(`${what}: material "${local.name}" is not defined; using default color`);
             }
           }
         }
@@ -393,13 +418,20 @@ export function parseURDF(text, opts = {}) {
   }
   model.root = roots[0].name;
 
-  // Mimic resolution: follow chains, detect cycles / bad targets.
+  // Mimic resolution, pass 1: drop invalid links so the result does not depend on joint order.
   for (const joint of model.joints.values()) {
     if (!joint.mimic) continue;
+    const target = model.joints.get(joint.mimic.joint);
     if (!MOVABLE_TYPES.has(joint.type)) {
       joint.mimic = null;
-      continue;
+    } else if (!target || !MOVABLE_TYPES.has(target.type) || target === joint) {
+      warn(`joint "${joint.name}": mimics "${joint.mimic.joint}" which is missing or not movable; mimic ignored`);
+      joint.mimic = null;
     }
+  }
+  // Pass 2: follow chains on the cleaned graph, detect cycles.
+  for (const joint of model.joints.values()) {
+    if (!joint.mimic) continue;
     let multiplier = 1;
     let offset = 0;
     let cur = joint;

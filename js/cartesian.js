@@ -7,7 +7,7 @@ import {
 } from 'three';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { KinematicChain, originMatrix } from './kinematics/chain.js';
-import { solveIK, solveIKRobust } from './kinematics/ik.js';
+import { solveIK, solveIKRobust, IK_DEFAULTS } from './kinematics/ik.js';
 import { defaultTipLink } from './urdf/robot.js';
 
 const _m = new Matrix4();
@@ -91,6 +91,7 @@ export class CartesianController extends EventTarget {
     }
     const tip = defaultTipLink(robot.model);
     this.reference = robot.model.root;
+    this.tcpOffset = { xyz: [0, 0, 0], rpy: [0, 0, 0] }; // a tool offset belongs to the previous robot
     this.setTip(tip);
   }
 
@@ -105,6 +106,7 @@ export class CartesianController extends EventTarget {
   setReference(link) {
     this.reference = link;
     this.syncTarget();
+    this.dispatchEvent(new CustomEvent('chain'));
   }
 
   setIkMode(mode) {
@@ -262,13 +264,33 @@ export class CartesianController extends EventTarget {
     return { position: pos, quaternion: rot };
   }
 
+  /**
+   * IK for a jog target: iterate to tight tolerances (so small steps are not swallowed
+   * by the solver tolerance and residuals do not accumulate) but judge success with the
+   * normal ones. Rotation jogs always need orientation, even when the chain is in
+   * position-only mode — otherwise they would "succeed" without moving.
+   */
+  _solveJog(axis, target, q0, maxIterations) {
+    const mode = axis >= 3 ? 'full' : this.ikMode;
+    const res = solveIK(this.chain, q0, target, { mode, maxIterations, positionTolerance: 1e-7, orientationTolerance: 1e-6 });
+    res.converged = res.positionError < IK_DEFAULTS.positionTolerance
+      && (mode !== 'full' || res.orientationError < IK_DEFAULTS.orientationTolerance);
+    return res;
+  }
+
+  _blockedMessage(axis) {
+    return axis >= 3 && this.ikMode === 'position'
+      ? 'Rotation not reachable with this chain'
+      : 'Jog blocked: joint limit, singularity or out of reach';
+  }
+
   /** One jog increment. Returns true if the robot moved. */
   jogStep(axis, sign, frame, linearStep, angularStep) {
     if (!this.chain) return false;
     const amount = sign * (axis < 3 ? linearStep : angularStep);
     const target = this._jogged(this.tcpMatrix(new Matrix4()), axis, amount, frame);
     const values = this.hooks.getValues();
-    const res = solveIK(this.chain, this.chain.getQ(values), target, { mode: this.ikMode, maxIterations: 80 });
+    const res = this._solveJog(axis, target, this.chain.getQ(values), 100);
     this.lastResult = res;
     if (res.converged) {
       this.hooks.apply(this.chain.toValues(res.q, {}), 'jog');
@@ -276,7 +298,7 @@ export class CartesianController extends EventTarget {
       this.syncTarget();
       return true;
     }
-    this._emitStatus('Jog blocked: joint limit, singularity or out of reach');
+    this._emitStatus(this._blockedMessage(axis));
     return false;
   }
 
@@ -299,16 +321,39 @@ export class CartesianController extends EventTarget {
     const { axis, sign, frame, target } = this.jog;
     const rate = axis < 3 ? this.jogSpeed.linear : this.jogSpeed.angular;
     const base = new Matrix4().compose(target.position, target.quaternion, new Vector3(1, 1, 1));
-    const next = this._jogged(base, axis, sign * rate * dt, frame);
-    const values = this.hooks.getValues();
-    const res = solveIK(this.chain, this.chain.getQ(values), next, { mode: this.ikMode, maxIterations: 40 });
+    const q0 = this.chain.getQ(this.hooks.getValues());
+    // Joint speed this step would need, relative to each joint's URDF velocity limit.
+    const ratioOf = (q) => {
+      let r = 0;
+      for (let i = 0; i < q.length; i++) r = Math.max(r, Math.abs(q[i] - q0[i]) / (Math.max(dt, 1e-3) * this.chain.velocity[i]));
+      return r;
+    };
+    let step = sign * rate * dt;
+    let next = this._jogged(base, axis, step, frame);
+    let res = this._solveJog(axis, next, q0, 40);
+    let slowed = false;
+    if (res.converged) {
+      const ratio = ratioOf(res.q);
+      if (ratio > 1) {
+        // Near a singularity: shrink the Cartesian increment so joints stay within their limits.
+        step /= ratio * 1.05;
+        next = this._jogged(base, axis, step, frame);
+        res = this._solveJog(axis, next, q0, 40);
+        slowed = true;
+        if (res.converged && ratioOf(res.q) > 1.1) res.converged = false;
+      }
+    }
     this.lastResult = res;
     if (!res.converged) {
-      this._emitStatus('Jog blocked: joint limit, singularity or out of reach');
+      this._emitStatus(slowed ? 'Jog blocked near a singularity' : this._blockedMessage(axis));
       return false; // keep the last good target; robot stays put
     }
     this.jog.target = next;
     this.hooks.apply(this.chain.toValues(res.q, {}), 'jog');
+    if (slowed !== this._jogSlowed) {
+      this._jogSlowed = slowed;
+      this._emitStatus(slowed ? 'Slowed near a singularity' : '');
+    }
     return true;
   }
 

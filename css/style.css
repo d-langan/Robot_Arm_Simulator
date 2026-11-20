@@ -107,6 +107,7 @@ input.num {
   text-align: right;
   width: 84px;
 }
+input.num.invalid { border-color: var(--bad); color: var(--bad); }
 .text-input { width: 100%; padding: 8px 10px; margin: 8px 0 4px; }
 .btn-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
 .btn-row.right { justify-content: flex-end; }
@@ -344,6 +345,11 @@ dialog li { margin: 3px 0; }
 .toast-warn { border-left: 3px solid var(--warn); }
 .toast-error { border-left: 3px solid var(--bad); }
 .toast-info { border-left: 3px solid var(--accent); }
+
+/* iOS Safari zooms into any focused control under 16px; keep touch devices at 16px. */
+@media (pointer: coarse) {
+  input, select, textarea { font-size: 16px; }
+}
 
 /* ---------- narrow screens ---------- */
 @media (max-width: 900px) {

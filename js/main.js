@@ -24,6 +24,8 @@ const FALLBACK_ROBOTS = [
 ];
 const VIEW_DEFAULTS = { visual: true, collision: false, frames: false, axes: false, skeleton: false, tcp: true, points: true, grid: true };
 const MANUAL_SOURCES = new Set(['joint-panel', 'joint-panel-btn', 'gizmo', 'jog', 'cart-input', 'cart-slider']);
+// Sources whose IK result the Cartesian status / HUD warning describes.
+const IK_SOURCES = new Set(['gizmo', 'jog', 'cart-input', 'cart-slider']);
 
 class App {
   constructor() {
@@ -63,6 +65,7 @@ class App {
       },
     });
     this.cart.addEventListener('status', () => this._updateHud());
+    this.cart.addEventListener('chain', () => this._updateHud());
 
     this._initToolbar();
     this._initModeSwitch();
@@ -88,6 +91,11 @@ class App {
   }
 
   _onJointsChanged(source) {
+    // An IK failure message is stale once the robot has been moved some other way.
+    if (!IK_SOURCES.has(source) && this.cart.lastResult) {
+      this.cart.lastResult = null;
+      this.cart._emitStatus('');
+    }
     const values = this.getValues();
     this.jointPanel.refresh(values, source);
     if (this.mode === 'cartesian') this.cartPanel.refresh(values);
@@ -129,6 +137,8 @@ class App {
     select.addEventListener('change', () => {
       const v = select.value;
       if (v.startsWith('builtin:')) this.loadBuiltin(v.slice(8));
+      // The "Uploaded:"/"URL:" entry only labels the current custom robot; it cannot be reloaded.
+      else select.value = this._selectValue || select.value;
     });
 
     const fileInput = document.getElementById('file-input');
@@ -136,59 +146,93 @@ class App {
     document.getElementById('btn-open-files').addEventListener('click', () => fileInput.click());
     document.getElementById('btn-open-folder').addEventListener('click', () => folderInput.click());
     document.getElementById('btn-open-url').addEventListener('click', () => this._urlDialog());
-    fileInput.addEventListener('change', async () => {
-      if (fileInput.files.length) await this.loadEntries(entriesFromFileList(fileInput.files));
-      fileInput.value = '';
-    });
-    folderInput.addEventListener('change', async () => {
-      if (folderInput.files.length) await this.loadEntries(entriesFromFileList(folderInput.files));
-      folderInput.value = '';
-    });
+    for (const input of [fileInput, folderInput]) {
+      input.addEventListener('change', async () => {
+        try {
+          if (input.files.length) await this.loadEntries(entriesFromFileList(input.files));
+        } finally {
+          input.value = '';
+        }
+      });
+    }
     this._initDragDrop();
 
     const params = new URLSearchParams(location.search);
+    let urlError = null;
     if (params.get('urdf')) {
       const ok = await this.loadUrl(params.get('urdf'));
       if (ok) return;
+      urlError = document.querySelector('#robot-card .error-box')?.textContent || 'Could not load the linked URDF.';
     }
     const id = params.get('robot');
     await this.loadBuiltin(id && this.builtins.some((r) => r.id === id) ? id : this.builtins[0].id);
+    // Loading the fallback re-renders the robot card; keep the reason the link failed visible.
+    if (urlError) document.getElementById('robot-card').append(h('div.error-box', { role: 'alert' }, `${urlError} Showing the default robot instead.`));
   }
 
   async loadBuiltin(id) {
     const def = this.builtins.find((r) => r.id === id) || this.builtins[0];
     const select = document.getElementById('robot-select');
     select.value = `builtin:${def.id}`;
+    this._selectValue = select.value;
     return this.loadUrl(def.urdf, { label: def.name, home: def.home, packages: def.packages, builtin: true });
   }
 
+  /** A load is current until another one starts; superseded loads must not touch the UI. */
+  _isStale(token) {
+    return token !== this.loadToken;
+  }
+
   async loadUrl(url, { label, home, packages, builtin = false } = {}) {
+    const token = ++this.loadToken;
     this._setLoading(`Loading ${label || url}…`);
+    // GitHub "blob" page URLs serve HTML; the raw file lives on raw.githubusercontent.com.
+    const gh = /^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/(.+)$/.exec(url);
+    if (gh) url = `https://raw.githubusercontent.com/${gh[1]}/${gh[2]}/${gh[3]}`;
     let text;
     try {
       const res = await fetch(url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       text = await res.text();
     } catch (e) {
+      if (this._isStale(token)) return false;
       this._setLoading(null);
-      this._showError(`Could not fetch ${url}: ${e.message}`);
+      const hint = e instanceof TypeError ? ' (the server must allow cross-origin requests over https; raw.githubusercontent.com does)' : '';
+      this._showError(`Could not fetch ${url}: ${e.message}${hint}`);
       return false;
     }
-    const ok = await this._loadText(text, new UrlResolver(url, packages || {}), { label: label || url, home });
-    if (ok && !builtin) this._markCustom(this.robot.name);
+    if (this._isStale(token)) return false;
+    const ok = await this._loadText(text, new UrlResolver(url, packages || {}), { label: label || url, home }, token);
+    if (ok && !builtin) this._markCustom(this.robot.name, 'URL');
     return ok;
   }
 
   async loadEntries(entries) {
+    const token = ++this.loadToken;
+    try {
+      return await this._loadEntries(entries, token);
+    } catch (e) {
+      // Files moved/deleted/locked after being picked: never leave the overlay up.
+      if (this._isStale(token)) return false;
+      this._setLoading(null);
+      this._showError(`Could not read files: ${e.message}`);
+      return false;
+    }
+  }
+
+  async _loadEntries(entries, token) {
     this._setLoading('Reading files…');
     try {
       entries = await expandZips(entries);
     } catch (e) {
+      if (this._isStale(token)) return false;
       this._setLoading(null);
       this._showError(`Could not read zip: ${e.message}`);
       return false;
     }
+    if (this._isStale(token)) return false;
     const { urdfs, xacros, sdfs } = await findRobotFiles(entries);
+    if (this._isStale(token)) return false;
     if (!urdfs.length) {
       this._setLoading(null);
       if (xacros.length) {
@@ -204,18 +248,22 @@ class App {
     if (urdfs.length > 1) {
       this._setLoading(null);
       chosen = await this._chooseDialog('Several URDF files found', urdfs.map((u) => u.path));
-      if (chosen === null) return false;
+      if (chosen === null || this._isStale(token)) return false;
       chosen = urdfs[chosen];
     }
     const text = await chosen.file.text();
+    if (this._isStale(token)) return false;
     const meshCount = entries.length - urdfs.length;
-    const ok = await this._loadText(text, new FileResolver(entries, chosen.path), { label: chosen.path, fileCount: meshCount });
-    if (ok) this._markCustom(this.robot.name);
+    const ok = await this._loadText(text, new FileResolver(entries, chosen.path), { label: chosen.path, fileCount: meshCount }, token);
+    if (ok) this._markCustom(this.robot.name, 'Uploaded');
     return ok;
   }
 
-  async _loadText(text, resolver, { label, home, fileCount } = {}) {
-    const token = ++this.loadToken;
+  async _loadText(text, resolver, { label, home, fileCount } = {}, token = ++this.loadToken) {
+    if (this._isStale(token)) {
+      resolver.dispose();
+      return false;
+    }
     let model;
     try {
       model = parseURDF(text);
@@ -229,7 +277,10 @@ class App {
     this.runner.stop();
     if (this.robot) this.robot.dispose();
     const robot = new Robot(model, resolver);
+    // Textures (URDF <texture>, inside DAE files) finish after the meshes; render when they land.
+    robot.meshLoader.manager.onProgress = () => this.viewer.requestRender();
     this.robot = robot;
+    this._autoSkeleton = false;
     this.viewer.world.add(robot.object);
     if (home) robot.setJointValues(home);
 
@@ -247,13 +298,15 @@ class App {
     this._setLoading(null);
     const missing = [...robot.meshLoader.missing];
     const failed = [...robot.meshLoader.failed.entries()];
+    const substituted = [...robot.meshLoader.substituted.entries()];
     let visualMeshes = 0;
     for (const l of robot.links.values()) l.visual.traverse((c) => { if (c.isMesh) visualMeshes++; });
     if (visualMeshes === 0 && !this.view.skeleton) {
-      robot.setDisplay({ skeleton: true });
-      this._setToggle('skeleton', true, false);
+      // Show the skeleton for this robot only; the user's saved preference is untouched.
+      this._autoSkeleton = true;
+      this._applyView();
     }
-    this._renderRobotCard({ label, missing, failed, fileCount });
+    this._renderRobotCard({ label, missing, failed, substituted, fileCount });
     this.viewer.fitTo(robot.object, { keepDirection: false });
     this.cart.syncTarget();
     this._refreshMarkers();
@@ -265,15 +318,16 @@ class App {
     return true;
   }
 
-  _markCustom(name) {
+  _markCustom(name, kind = 'Uploaded') {
     const select = document.getElementById('robot-select');
     let opt = select.querySelector('option[value="custom"]');
     if (!opt) {
       opt = h('option', { value: 'custom' });
       select.append(opt);
     }
-    opt.textContent = `Uploaded: ${name}`;
+    opt.textContent = `${kind}: ${name}`;
     select.value = 'custom';
+    this._selectValue = 'custom';
   }
 
   _setLoading(message) {
@@ -290,7 +344,7 @@ class App {
     card.append(err);
   }
 
-  _renderRobotCard({ label, missing = [], failed = [], loading = false, fileCount } = {}) {
+  _renderRobotCard({ label, missing = [], failed = [], substituted = [], loading = false, fileCount } = {}) {
     const r = this.robot;
     const card = document.getElementById('robot-card');
     if (!r) {
@@ -303,6 +357,7 @@ class App {
     const warnings = m.warnings;
     const issues = [
       ...missing.map((x) => `Missing mesh: ${x}`),
+      ...substituted.map(([x, used]) => `Missing mesh: ${x} — showing ${used} instead (same file name, different folder)`),
       ...failed.map(([x, e]) => `Could not load ${x}: ${e}`),
       ...warnings,
     ];
@@ -315,12 +370,12 @@ class App {
         mimic ? h('span.chip', `${mimic} mimic`) : null,
         h('span.chip', `${r.stats.meshes} meshes`),
         loading ? h('span.chip.chip-busy', 'loading meshes…') : null,
-        !loading && missing.length ? h('span.chip.chip-warn', `${missing.length} missing`) : null,
+        !loading && missing.length + substituted.length ? h('span.chip.chip-warn', `${missing.length + substituted.length} missing`) : null,
       ),
       issues.length
         ? h('details.issues', h('summary', `${issues.length} note${issues.length === 1 ? '' : 's'} from the URDF`),
           h('ul', issues.slice(0, 200).map((x) => h('li', x))),
-          missing.length ? h('p.hint', fileCount === undefined
+          missing.length + substituted.length ? h('p.hint', fileCount === undefined
             ? 'Mesh paths are resolved relative to the URDF URL (package:// assumes the URDF sits in <package>/urdf/).'
             : 'Tip: select the whole package folder (Open folder) or drop a .zip so mesh paths can be matched.') : null)
         : null,
@@ -415,12 +470,22 @@ class App {
     this.cart.setEnabled(this.mode === 'cartesian');
     this.cart.setTcpVisible(this.mode === 'cartesian' || this.view.tcp);
     if (this.mode === 'cartesian') this.cartPanel.refresh(this.getValues(), true);
+    this._updateJointReadout(this.getValues());
     this._updateHud();
   }
 
   _initToolbar() {
     for (const b of document.querySelectorAll('.view-toolbar [data-view]')) {
-      b.addEventListener('click', () => this._setToggle(b.dataset.view, !this.view[b.dataset.view]));
+      b.addEventListener('click', () => {
+        const key = b.dataset.view;
+        if (key === 'skeleton' && this._autoSkeleton) {
+          // Auto-shown for a mesh-less robot: the click turns it off.
+          this._autoSkeleton = false;
+          this._setToggle('skeleton', false);
+          return;
+        }
+        this._setToggle(key, !this.view[key]);
+      });
     }
     document.getElementById('btn-fit').addEventListener('click', () => this.robot && this.viewer.fitTo(this.robot.object));
     document.getElementById('btn-help').addEventListener('click', () => this._help());
@@ -441,11 +506,12 @@ class App {
 
   _applyView() {
     const v = this.view;
+    const skeleton = !!(v.skeleton || this._autoSkeleton);
     for (const b of document.querySelectorAll('.view-toolbar [data-view]')) {
-      b.setAttribute('aria-pressed', String(!!v[b.dataset.view]));
+      b.setAttribute('aria-pressed', String(b.dataset.view === 'skeleton' ? skeleton : !!v[b.dataset.view]));
     }
     if (this.robot) {
-      this.robot.setDisplay({ visual: v.visual, collision: v.collision, frames: v.frames, axes: v.axes, skeleton: v.skeleton });
+      this.robot.setDisplay({ visual: v.visual, collision: v.collision, frames: v.frames, axes: v.axes, skeleton });
     }
     this.viewer.grid.visible = v.grid;
     this.viewer.worldAxes.visible = v.grid;
@@ -456,10 +522,17 @@ class App {
 
   _initShortcuts() {
     window.addEventListener('keydown', (e) => {
+      // Keys a control already handled (Space/Enter on a jog button) and keys inside an
+      // open dialog belong to that control, not to the app behind it.
+      if (e.defaultPrevented || document.querySelector('dialog[open]')) return;
       const t = e.target;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       const k = e.key.toLowerCase();
+      if (e.repeat && (k === 'p' || k === ' ')) {
+        if (k === ' ') e.preventDefault();
+        return;
+      }
       if (k === 'j') this.setMode('joint');
       else if (k === 'c') this.setMode('cartesian');
       else if (k === 'w' && this.mode === 'cartesian') { this.cart.setGizmoMode('translate'); this.cartPanel.gizmoModeSeg?.setValue('translate'); }
@@ -479,13 +552,15 @@ class App {
   _updateJointReadout(values) {
     const el = document.getElementById('joint-readout');
     if (!this.robot || el.hidden) return;
-    if (el.dataset.robot !== this.robot.name + this.robot.controllable.length) {
-      el.dataset.robot = this.robot.name + this.robot.controllable.length;
+    const key = this.robot.controllable.map((j) => j.name).join(',');
+    if (el.dataset.key !== key) {
+      el.dataset.key = key;
       el.replaceChildren(h('h3', 'Joint values'), h('div.readout-grid', this.robot.controllable.map((j) =>
         h('div.readout-item', { dataset: { joint: j.name } }, h('span.readout-name', { title: j.name }, j.name), h('span.readout-val')))));
     }
     for (const item of el.querySelectorAll('.readout-item')) {
       const j = this.robot.model.joints.get(item.dataset.joint);
+      if (!j) continue;
       const v = values[j.name] ?? 0;
       item.querySelector('.readout-val').textContent = `${fmtJoint(j, v)}${jointUnit(j)}`;
       const span = j.limit.upper - j.limit.lower;
@@ -543,4 +618,12 @@ class App {
   }
 }
 
-window.app = new App();
+try {
+  window.app = new App();
+} catch (e) {
+  // Most likely no WebGL 2 (three.js r170 requires it).
+  console.error(e);
+  setChildren(document.getElementById('robot-card'), h('div.error-box', { role: 'alert' },
+    `Could not start the 3D view. WebGL 2 is required — check that hardware acceleration is enabled in the browser. (${e.message})`));
+  setChildren(document.getElementById('robot-select'), h('option', 'Unavailable'));
+}

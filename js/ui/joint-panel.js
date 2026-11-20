@@ -71,14 +71,22 @@ export class JointPanel {
           h('span', `${hi.toFixed(0)}${unit}`),
         ),
       );
-      const send = (display) => {
+      const fmt = (x) => toDisplay(j, x).toFixed(j.type === 'prismatic' ? 1 : 2);
+      const send = (display, fromField = false) => {
+        // An emptied field means "not entered yet", not 0.
+        if (String(display).trim() === '') {
+          if (fromField) num.value = fmt(this.robot.getJointValue(j.name));
+          return;
+        }
         const v = fromDisplay(j, Number(display));
         if (!Number.isFinite(v)) return;
         this.app.setJoints({ [j.name]: v }, 'joint-panel');
+        // Show the applied (clamped) value even though the field still has focus.
+        if (fromField) num.value = fmt(this.robot.getJointValue(j.name));
       };
       slider.addEventListener('input', () => send(slider.value));
-      num.addEventListener('change', () => send(num.value));
-      num.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(num.value); });
+      num.addEventListener('change', () => send(num.value, true));
+      num.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(num.value, true); });
       this.rows.set(j.name, { joint: j, slider, num, row, lo, hi });
       list.append(row);
     }
@@ -92,7 +100,8 @@ export class JointPanel {
       const v = values[name];
       if (!Number.isFinite(v)) continue;
       const d = toDisplay(r.joint, v);
-      if (!(source === 'joint-panel' && document.activeElement === r.num)) {
+      // Never overwrite a field the user is typing in (a running program refreshes every frame).
+      if (document.activeElement !== r.num) {
         r.num.value = d.toFixed(r.joint.type === 'prismatic' ? 1 : 2);
       }
       if (!(source === 'joint-panel' && document.activeElement === r.slider)) r.slider.value = String(d);

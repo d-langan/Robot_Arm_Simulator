@@ -75,16 +75,22 @@ export class CartesianPanel {
     AXES.forEach((name, i) => {
       const lin = i < 3;
       const range = lin ? this.linRange : 180;
-      const inp = h('input.num', { type: 'number', step: lin ? 1 : 0.5, 'aria-label': `${name} ${lin ? 'mm' : 'degrees'}` });
+      const inp = h('input.num', { type: 'number', step: lin ? 1 : 0.5, 'aria-label': `${name} ${lin ? 'mm' : 'degrees'}`, title: 'Type a value, then Enter or "Go to pose"' });
+      // Typed values are a pending target: committed with Enter or "Go to pose" (not on blur),
+      // so several axes can be edited before moving, and they survive robot motion meanwhile.
+      inp.addEventListener('input', () => { inp.dataset.dirty = '1'; inp.classList.remove('invalid'); });
       inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') this._goTo(); });
-      inp.addEventListener('change', () => this._goTo());
       const sl = h('input.slider', { type: 'range', min: -range, max: range, step: lin ? 0.5 : 0.1, 'aria-label': `${name} slider (${lin ? 'mm' : 'degrees'})` });
-      sl.addEventListener('pointerdown', () => { this.dragAxis = i; });
+      // A drag lives from pointerdown to pointerup; 'change' does not fire when the value
+      // ends where it started, so it cannot be relied on to end the drag.
+      sl.addEventListener('pointerdown', () => { this.dragAxis = i; this.dragBase = null; });
+      sl.addEventListener('pointerup', () => this._slideEnd());
+      sl.addEventListener('pointercancel', () => this._slideEnd());
       sl.addEventListener('input', () => {
         this.dragAxis = i;
         this._slide(i, Number(sl.value));
       });
-      sl.addEventListener('change', () => this._slideEnd());
+      sl.addEventListener('change', () => this._slideEnd()); // keyboard
       this.fields.push(inp);
       this.sliders.push(sl);
       poseGrid.append(h('div.cart-axis-row',
@@ -120,8 +126,8 @@ export class CartesianPanel {
     });
 
     // Gizmo.
-    const gizmoMode = this._segmented('gizmo-mode', [['translate', 'Move (W)'], ['rotate', 'Rotate (E)']], 'translate', (v) => cart.setGizmoMode(v));
-    const gizmoSpace = this._segmented('gizmo-space', [['local', 'Tool axes'], ['world', 'World axes']], 'local', (v) => cart.setGizmoSpace(v));
+    const gizmoMode = this._segmented('gizmo-mode', [['translate', 'Move (W)'], ['rotate', 'Rotate (E)']], cart.gizmo.mode, (v) => cart.setGizmoMode(v));
+    const gizmoSpace = this._segmented('gizmo-space', [['local', 'Tool axes'], ['world', 'World axes']], cart.gizmo.space, (v) => cart.setGizmoSpace(v));
     this.gizmoModeSeg = gizmoMode;
     this.gizmoSpaceSeg = gizmoSpace;
 
@@ -220,12 +226,21 @@ export class CartesianPanel {
   }
 
   _goTo() {
+    if (this.fields.some((f) => f.value.trim() === '')) {
+      this.cart._emitStatus('Enter a value for every axis');
+      return;
+    }
     const vals = this.fields.map((f) => Number(f.value));
     if (vals.some((v) => !Number.isFinite(v))) return;
     const pos = vals.slice(0, 3).map((v) => v / 1000);
     const rpy = vals.slice(3).map((v) => v * DEG2RAD);
-    this.cart.goToReferencePose(pos, rpy);
-    this.refresh(this.app.getValues(), true);
+    const res = this.cart.goToReferencePose(pos, rpy);
+    if (res && res.converged) {
+      this.refresh(this.app.getValues(), true);
+    } else {
+      // Keep the typed target so it can be corrected; flag the fields that were edited.
+      for (const f of this.fields) if (f.dataset.dirty) f.classList.add('invalid');
+    }
   }
 
   /** Slider drag: replace one axis of the current target and track it with local IK. */
@@ -233,7 +248,9 @@ export class CartesianPanel {
     // Freeze the other five axes at drag start; re-reading them from the live pose
     // would let IK residuals accumulate into drift over a long drag.
     if (!this.dragBase || this.dragBaseAxis !== i) {
-      this.dragBase = this.fields.map((f) => Number(f.value));
+      const live = this._poseValues(this.app.getValues());
+      // Use what the fields show (angle-continuous), but never a blank or pending typed value.
+      this.dragBase = this.fields.map((f, k) => (f.dataset.dirty || f.value.trim() === '' || !Number.isFinite(Number(f.value)) ? live[k] : Number(f.value)));
       this.dragBaseAxis = i;
     }
     const vals = this.dragBase.slice();
@@ -245,11 +262,19 @@ export class CartesianPanel {
   }
 
   _slideEnd() {
+    if (this.dragAxis < 0 && !this.dragBase) return; // already ended (pointerup + change)
+    const dragged = this.dragBase != null;
     const res = this.cart.lastResult;
     this.dragAxis = -1;
     this.dragBase = null;
-    if (res && !res.converged) this.cart._emitStatus('Out of reach — sliders returned to the closest pose');
-    this.refresh(this.app.getValues(), true);
+    if (dragged && res && !res.converged) this.cart._emitStatus('Out of reach — sliders returned to the closest pose');
+    this.refresh(this.app.getValues(), dragged);
+  }
+
+  /** TCP pose in the reference frame as display values: mm and degrees. */
+  _poseValues(values) {
+    const pose = this.cart.tcpInReference(values);
+    return [pose.position.x * 1000, pose.position.y * 1000, pose.position.z * 1000, ...pose.rpy.map((r) => r * RAD2DEG)];
   }
 
   _setFill(i) {
@@ -262,9 +287,12 @@ export class CartesianPanel {
   /** Update pose fields and sliders from the robot. The axis being edited/dragged is left alone unless `force`. */
   refresh(values, force = false) {
     if (!this.fields || !this.cart.chain) return;
-    const pose = this.cart.tcpInReference(values);
-    const vals = [pose.position.x * 1000, pose.position.y * 1000, pose.position.z * 1000, ...pose.rpy.map((r) => r * RAD2DEG)];
+    const vals = this._poseValues(values);
     this.fields.forEach((f, i) => {
+      if (force) {
+        delete f.dataset.dirty;
+        f.classList.remove('invalid');
+      }
       let v = vals[i];
       if (i >= 3) {
         // Keep angles continuous with what is shown (±180° is the same angle; avoid the display flipping sign).
@@ -273,7 +301,7 @@ export class CartesianPanel {
           for (const c of [v - 360, v + 360]) if (Math.abs(c - prev) < Math.abs(v - prev) && Math.abs(c) <= 185) v = c;
         }
       }
-      const busy = !force && (document.activeElement === f || this.dragAxis === i);
+      const busy = !force && (document.activeElement === f || this.dragAxis === i || f.dataset.dirty);
       if (!busy) f.value = v.toFixed(i < 3 ? 1 : 2);
       if (this.sliders && this.sliders[i] && (force || this.dragAxis !== i)) {
         this.sliders[i].value = String(v);

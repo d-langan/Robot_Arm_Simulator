@@ -83,7 +83,8 @@ export class WaypointMarkers {
     // Path preview between consecutive points (segment i ends at point i).
     const segs = [];
     for (let i = 1; i < points.length; i++) segs.push([i - 1, i]);
-    if (loop && points.length > 2) segs.push([points.length - 1, 0]);
+    // The return leg uses the first point's move type, so with two points it can differ from the outbound leg.
+    if (loop && (points.length > 2 || (points.length === 2 && points[0].move !== points[1].move))) segs.push([points.length - 1, 0]);
     for (const [a, b] of segs) {
       const pa = points[a];
       const pb = points[b];

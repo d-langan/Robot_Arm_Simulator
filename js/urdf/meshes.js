@@ -80,6 +80,8 @@ export class MeshLoader {
     this.cache = new Map();   // resolved path -> Promise<{ kind, value }>
     this.missing = new Set(); // refs that could not be resolved
     this.failed = new Map();  // ref -> error message (resolved but undecodable)
+    this.substituted = new Map(); // ref -> file used because only its name matched
+    this.defaultMaterial = null;
   }
 
   /**
@@ -102,6 +104,9 @@ export class MeshLoader {
       else this.failed.set(ref, e.message);
       return null;
     }
+    if (this.resolver.approximate && this.resolver.approximate.has(ref)) {
+      this.substituted.set(ref, this.resolver.approximate.get(ref));
+    }
     let entry = this.cache.get(asset.path);
     if (!entry) {
       entry = this.decode(ext, asset).catch((e) => {
@@ -120,9 +125,28 @@ export class MeshLoader {
     }
     // Object (DAE / glTF / OBJ): clone shares geometry & materials.
     const obj = decoded.value.clone(true);
-    if (decoded.applyUrdfMaterial && material && material.color) {
+    const hasUrdfMat = !!(material && (material.color || material.texture));
+    if (decoded.applyUrdfMaterial && hasUrdfMat) {
+      // OBJ: the URDF material replaces the loader's placeholder.
       const mat = makeUrdfMaterial(material, this.resolver, this.manager);
       obj.traverse((c) => { if (c.isMesh) c.material = mat; });
+    } else if (decoded.ownMaterials) {
+      // COLLADA: keep the file's own materials; sub-meshes without one get the URDF
+      // material (as RViz does) or a neutral grey instead of ColladaLoader's white/magenta.
+      let mat = null;
+      const fallback = () => {
+        if (!mat) {
+          mat = hasUrdfMat
+            ? makeUrdfMaterial(material, this.resolver, this.manager)
+            : (this.defaultMaterial ||= makeUrdfMaterial(null));
+        }
+        return mat;
+      };
+      obj.traverse((c) => {
+        if (!c.isMesh) return;
+        if (Array.isArray(c.material)) c.material = c.material.map((m) => (decoded.ownMaterials.has(m) ? m : fallback()));
+        else if (!decoded.ownMaterials.has(c.material)) c.material = fallback();
+      });
     }
     return obj;
   }
@@ -160,7 +184,8 @@ export class MeshLoader {
         // when the tag is ignored (605 mm off when Y_UP is rotated to Z-up).
         scene.rotation.set(0, 0, 0);
         stripLightsAndCameras(scene);
-        return { kind: 'object', value: scene, applyUrdfMaterial: false };
+        const ownMaterials = new Set(Object.values((dae.library && dae.library.materials) || {}).map((m) => m.build).filter(Boolean));
+        return { kind: 'object', value: scene, applyUrdfMaterial: false, ownMaterials };
       }
       case 'obj': {
         const text = new TextDecoder().decode(data);

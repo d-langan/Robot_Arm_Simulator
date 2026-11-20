@@ -158,6 +158,46 @@ try {
   check('program runs MoveL to completion', prog.state === 'done' && prog.err < 2e-3, JSON.stringify(prog));
   await page.screenshot({ path: join(out, '03-ur10-program.png') });
 
+  // Regressions from review: keyboard focus, dialogs, tiny jog steps.
+  await page.evaluate(() => { window.app.setMode('cartesian'); });
+  await page.focus('#cartesian-panel .jog-btn:nth-child(2)'); // +X
+  await page.keyboard.press('Space');
+  await new Promise((r) => setTimeout(r, 200));
+  const spaceState = await page.evaluate(() => window.app.runner.state);
+  check('Space on a focused jog button does not start the program', spaceState === 'idle' || spaceState === 'done', spaceState);
+  const dlg = await page.evaluate(() => {
+    document.getElementById('btn-help').click();
+    const before = window.app.programPanel.points.length;
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'p', bubbles: true }));
+    const after = window.app.programPanel.points.length;
+    document.getElementById('dialog').close();
+    return { before, after };
+  });
+  check('shortcuts are ignored while a dialog is open', dlg.before === dlg.after, JSON.stringify(dlg));
+  const tiny = await page.evaluate(() => {
+    const app = window.app;
+    const x0 = app.cart.tcpInReference(app.getValues()).position.x;
+    for (let k = 0; k < 5; k++) app.cart.jogStep(0, 1, 'ref', 0.0001, 0);
+    return (app.cart.tcpInReference(app.getValues()).position.x - x0) * 1000;
+  });
+  check('five 0.1 mm jog steps move 0.5 mm', Math.abs(tiny - 0.5) < 0.02, `${tiny.toFixed(4)} mm`);
+  // Same-named robot reloaded with renamed joints while in Cartesian mode (used to crash and stick the overlay).
+  const renamed = await page.evaluate(async () => {
+    const mk = (a, b) => `<robot name="testbot"><link name="l0"/><link name="l1"/><link name="l2"/>
+      <joint name="${a}" type="revolute"><parent link="l0"/><child link="l1"/><origin xyz="0 0 0.3"/><axis xyz="0 0 1"/><limit lower="-3" upper="3" effort="1" velocity="1"/></joint>
+      <joint name="${b}" type="revolute"><parent link="l1"/><child link="l2"/><origin xyz="0.3 0 0"/><axis xyz="0 1 0"/><limit lower="-3" upper="3" effort="1" velocity="1"/></joint></robot>`;
+    const load = (xml) => window.app.loadEntries([{ path: 'testbot.urdf', file: new Blob([xml]) }]);
+    await load(mk('a1', 'a2'));
+    const ok2 = await load(mk('b1', 'b2'));
+    return {
+      ok2,
+      overlayHidden: document.getElementById('loading').hidden,
+      readout: [...document.querySelectorAll('#joint-readout .readout-item')].map((e) => e.dataset.joint).join(','),
+    };
+  });
+  check('reloading a robot with renamed joints in Cartesian mode works', renamed.ok2 && renamed.overlayHidden && renamed.readout === 'b1,b2', JSON.stringify(renamed));
+  await page.evaluate(() => window.app.setMode('joint'));
+
   // Upload a second URDF package (Fanuc) through the file input.
   if (fanucDir && existsSync(fanucDir)) {
     const files = [];

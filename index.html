@@ -83,6 +83,35 @@
   <div id="toasts" aria-live="polite"></div>
 
   <noscript><p style="padding:16px">This simulator needs JavaScript and WebGL.</p></noscript>
+  <script>
+    // If the module graph never starts (opened from file://, CDN blocked/offline, browser
+    // without import maps), say why instead of sitting on "Loading robot…".
+    (function () {
+      function fail(why) {
+        if (window.app) return;
+        var card = document.getElementById('robot-card');
+        if (!card) return;
+        var supportsImportMap = window.HTMLScriptElement && HTMLScriptElement.supports && HTMLScriptElement.supports('importmap');
+        var msg = location.protocol === 'file:'
+          ? 'Open this folder through a web server (for example: node tools/serve.mjs), not directly from the file system.'
+          : !supportsImportMap
+            ? 'This browser is too old: it needs import maps (Chrome 89+, Edge 89+, Firefox 108+, Safari 16.4+).'
+            : 'Could not start the simulator: ' + (why || 'three.js could not be loaded from cdn.jsdelivr.net (offline or blocked?)');
+        card.textContent = '';
+        var d = document.createElement('div');
+        d.className = 'error-box';
+        d.setAttribute('role', 'alert');
+        d.textContent = msg;
+        card.appendChild(d);
+      }
+      addEventListener('error', function (e) {
+        if (window.app) return;
+        if (e.target && e.target.tagName === 'SCRIPT') fail();
+        else if (e instanceof ErrorEvent) fail(e.message);
+      }, true);
+      if (location.protocol === 'file:') addEventListener('DOMContentLoaded', function () { fail(); });
+    })();
+  </script>
   <script type="module" src="js/main.js"></script>
 </body>
 </html>

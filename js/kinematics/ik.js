@@ -241,7 +241,7 @@ function rng(seed) {
  */
 export function unwrapToward(chain, q, ref) {
   for (let i = 0; i < q.length; i++) {
-    if (!chain.isAngular[i]) continue;
+    if (!chain.isAngular[i] || (chain.periodic && !chain.periodic[i])) continue;
     let best = q[i];
     let bestD = Math.abs(q[i] - ref[i]);
     for (let k = -2; k <= 2; k++) {

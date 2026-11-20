@@ -92,8 +92,10 @@ export function holdButton(btn, onStart, onEnd) {
   btn.addEventListener('pointercancel', end);
   btn.addEventListener('lostpointercapture', end);
   btn.addEventListener('keydown', (e) => {
-    if ((e.key === ' ' || e.key === 'Enter') && !active && !e.repeat) {
-      e.preventDefault();
+    if (e.key !== ' ' && e.key !== 'Enter') return;
+    // Always claim the key (repeats too) so global shortcuts don't also act on it.
+    e.preventDefault();
+    if (!active && !e.repeat) {
       active = true;
       btn.classList.add('held');
       onStart();

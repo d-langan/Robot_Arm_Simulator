@@ -68,8 +68,9 @@ export async function findRobotFiles(entries) {
     else if (ext === 'urdf') urdfs.push(e);
     else if (ext === 'sdf') sdfs.push(e);
     else if (ext === 'xml' && e.file.size < 20e6) {
-      const head = await e.file.slice(0, 4096).text();
-      if (/<robot[\s>]/.test(head) && !/xmlns:xacro/.test(head)) urdfs.push(e);
+      // xacro output keeps xmlns:xacro and comments, so only real <xacro:...> tags mean xacro.
+      const head = (await e.file.slice(0, 4096).text()).replace(/<!--[\s\S]*?(-->|$)/g, '');
+      if (/<robot[\s>]/.test(head)) (/<xacro:/.test(head) ? xacros : urdfs).push(e);
     }
   }
   // Prefer shallow paths and files whose name matches their folder.

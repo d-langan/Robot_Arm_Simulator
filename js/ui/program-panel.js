@@ -34,6 +34,11 @@ export class ProgramPanel {
     this.runner.stop();
     this.points = [];
     this.activeIndex = -1;
+    // Per-robot state: nothing from the previous robot carries over.
+    this.loop = false;
+    this.defaultMove = undefined;
+    this.runner.speedOverride = 1;
+    this._lastMessage = '';
     if (robot) {
       const saved = store.get(this._key());
       if (saved && Array.isArray(saved.points)) {
@@ -86,6 +91,8 @@ export class ProgramPanel {
       on: { click: () => (r.state === 'paused' ? r.resume() : r.state === 'running' || r.state === 'dwell' ? r.pause() : this.run()) },
     }, r.state === 'running' || r.state === 'dwell' ? '❚❚ Pause' : r.state === 'paused' ? '▶ Resume' : '▶ Run');
     const stopBtn = h('button.btn', { type: 'button', disabled: !running, on: { click: () => r.stop() } }, '■ Stop');
+    this.runBtn = runBtn;
+    this.stopBtn = stopBtn;
     const loopBox = h('input', { type: 'checkbox', checked: this.loop, 'aria-label': 'Loop program' });
     loopBox.addEventListener('change', () => { this.loop = loopBox.checked; r.loop = this.loop && !r.single; this._changed(); });
 
@@ -106,7 +113,11 @@ export class ProgramPanel {
     this.points.forEach((p, i) => list.append(this._row(p, i, running)));
 
     const importInput = h('input', { type: 'file', accept: '.json,application/json', hidden: true });
-    importInput.addEventListener('change', () => this._import(importInput.files[0]));
+    importInput.addEventListener('change', () => {
+      const f = importInput.files[0];
+      importInput.value = ''; // so picking the same file again (after a failure or cancel) fires 'change'
+      this._import(f);
+    });
 
     this.root.append(
       h('div.panel-head', h('h2', 'Program'), h('span.muted', `${this.points.length} point${this.points.length === 1 ? '' : 's'}`)),
@@ -120,7 +131,7 @@ export class ProgramPanel {
         h('button.btn.btn-sm', { type: 'button', on: { click: () => importInput.click() } }, 'Import…'),
         h('button.btn.btn-sm', { type: 'button', disabled: !this.points.length, on: { click: () => this._export() } }, 'Export'),
         h('span.spacer'),
-        h('button.btn.btn-sm.btn-danger', { type: 'button', disabled: !this.points.length || running, on: { click: () => this._clear() } }, 'Clear')),
+        (this.clearBtn = h('button.btn.btn-sm.btn-danger', { type: 'button', disabled: !this.points.length || running, on: { click: () => this._clear() } }, 'Clear'))),
       importInput,
     );
   }
@@ -154,7 +165,8 @@ export class ProgramPanel {
       this._changed();
     });
 
-    const act = (label, title, fn, disabled = false) => h('button.icon-btn', { type: 'button', title, 'aria-label': title, disabled, on: { click: fn } }, label);
+    // `edge`: disabled regardless of run state (first row's ↑, last row's ↓).
+    const act = (label, title, fn, disabled = false, edge = false) => h('button.icon-btn.wp-act', { type: 'button', title, 'aria-label': title, disabled, dataset: edge ? { edge: '1' } : undefined, on: { click: fn } }, label);
     const li = h('li.wp-row', { class: `wp-row${i === this.activeIndex ? ' active' : ''}`, dataset: { index: i } },
       h('span.wp-idx', String(i + 1)),
       name,
@@ -167,8 +179,8 @@ export class ProgramPanel {
           this._changed();
           toast(`${p.name} updated`, 'ok', 1500);
         }, running),
-        act('↑', 'Move up', () => this._move(i, -1), running || i === 0),
-        act('↓', 'Move down', () => this._move(i, 1), running || i === this.points.length - 1),
+        act('↑', 'Move up', () => this._move(i, -1), running || i === 0, i === 0),
+        act('↓', 'Move down', () => this._move(i, 1), running || i === this.points.length - 1, i === this.points.length - 1),
         act('✕', `Delete ${p.name}`, () => { this.points.splice(i, 1); this._render(); this._changed(); }, running)),
     );
     return li;
@@ -246,13 +258,31 @@ export class ProgramPanel {
     const prevActive = this.activeIndex;
     this.activeIndex = state === 'idle' || state === 'error' || state === 'done' ? -1 : index;
     if (state === 'error') toast(message, 'error', 7000);
-    // Re-render on state transitions (buttons/disabled states), otherwise just update text.
+    // Update in place: rebuilding the panel mid-run would destroy a field being typed in
+    // or a speed-override drag.
     if (state !== prevState || this.activeIndex !== prevActive) {
-      this._render();
+      this._syncRunState();
       this.app.onProgramChanged(this.points, this.activeIndex, this.loop);
-    } else if (this.statusEl) {
-      this.statusEl.textContent = this._statusText();
     }
-    if (this.statusEl) this.statusEl.className = `prog-status ${state}`;
+    if (this.statusEl) {
+      this.statusEl.textContent = this._statusText();
+      this.statusEl.className = `prog-status ${state}`;
+    }
+  }
+
+  /** Reflect the runner state on existing controls without rebuilding them. */
+  _syncRunState() {
+    const r = this.runner;
+    const running = r.active;
+    if (this.runBtn) {
+      this.runBtn.textContent = r.state === 'running' || r.state === 'dwell' ? '❚❚ Pause' : r.state === 'paused' ? '▶ Resume' : '▶ Run';
+      this.runBtn.disabled = !this.points.length;
+    }
+    if (this.stopBtn) this.stopBtn.disabled = !running;
+    if (this.clearBtn) this.clearBtn.disabled = !this.points.length || running;
+    for (const row of this.root.querySelectorAll('.wp-row')) {
+      row.classList.toggle('active', Number(row.dataset.index) === this.activeIndex);
+      for (const b of row.querySelectorAll('.wp-act')) b.disabled = running || b.dataset.edge === '1';
+    }
   }
 }

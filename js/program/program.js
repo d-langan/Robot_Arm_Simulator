@@ -7,6 +7,7 @@
 
 import { Matrix4, Vector3, Quaternion } from 'three';
 import { solveIK, rotationError } from '../kinematics/ik.js';
+import { clampJoint } from '../urdf/parser.js';
 
 export const PROGRAM_FORMAT = 'urdf-arm-sim-program';
 export const PROGRAM_VERSION = 1;
@@ -68,12 +69,19 @@ export function parseProgram(json, robot) {
   if (!Array.isArray(json.points)) throw new Error('Program has no "points" array');
   const warnings = [];
   if (json.robot && json.robot !== robot.name) warnings.push(`Program was made for "${json.robot}", loaded robot is "${robot.name}"`);
-  const names = new Set(robot.controllable.map((j) => j.name));
+  const byName = new Map(robot.controllable.map((j) => [j.name, j]));
+  const names = new Set(byName.keys());
   const points = json.points.map((p, i) => {
     const joints = {};
     let matched = 0;
     for (const [k, v] of Object.entries(p.joints || {})) {
-      if (names.has(k) && Number.isFinite(v)) { joints[k] = v; matched++; }
+      if (!names.has(k) || !Number.isFinite(v)) continue;
+      // Limits may have changed since the program was saved (edited URDF): clamp so the
+      // marker, MoveJ and MoveL all agree on where the point is.
+      const c = clampJoint(byName.get(k), v);
+      if (Math.abs(c - v) > 1e-9) warnings.push(`Point "${p.name || i + 1}": ${k} clamped to its joint limit`);
+      joints[k] = c;
+      matched++;
     }
     if (matched === 0) throw new Error(`Point ${i + 1} has no joints matching this robot`);
     if (matched < names.size) warnings.push(`Point "${p.name || i + 1}" is missing ${names.size - matched} joint(s); they keep their current value`);
@@ -135,7 +143,7 @@ export function planMoveL(robot, chain, fromValues, point, ikMode = 'full') {
   const qStart = chain.getQ(fromValues);
   const goalValues = { ...fromValues };
   for (const j of joints) if (Number.isFinite(point.joints[j.name])) goalValues[j.name] = point.joints[j.name];
-  const qGoal = chain.getQ(goalValues);
+  const qGoal = chain.clamp(chain.getQ(goalValues));
 
   const T0 = chain.fk(qStart, new Matrix4());
   const T1 = chain.fk(qGoal, new Matrix4());
@@ -149,16 +157,26 @@ export function planMoveL(robot, chain, fromValues, point, ikMode = 'full') {
   const chainNames = new Set(chain.variables.map((v) => v.name));
   const others = joints.filter((j) => !chainNames.has(j.name));
 
-  const N = Math.min(MOVEL_MAX_SAMPLES, Math.max(1, Math.ceil(Math.max(dist / MOVEL_STEP_POS, angle / MOVEL_STEP_ROT))));
+  // Sample count also covers joint motion that does not change the IK target (tool roll on a
+  // position-only chain, the elbow of a 7-DOF arm), so those joints move gradually too.
+  let jointSpan = 0;
+  for (let i = 0; i < chain.dof; i++) {
+    jointSpan = Math.max(jointSpan, Math.abs(qGoal[i] - qStart[i]) / (chain.isAngular[i] ? MOVEL_STEP_ROT : MOVEL_STEP_POS));
+  }
+  const N = Math.min(MOVEL_MAX_SAMPLES, Math.max(1, Math.ceil(Math.max(dist / MOVEL_STEP_POS, angle / MOVEL_STEP_ROT, jointSpan))));
   const samples = [Float64Array.from(qStart)];
   const target = { position: new Vector3(), quaternion: new Quaternion() };
   let prev = qStart;
+  const seed = new Float64Array(chain.dof);
   let maxRate = 0; // max over samples & joints of |dq| / vmax
   for (let k = 1; k <= N; k++) {
     const u = k / N;
     target.position.lerpVectors(p0, p1, u);
     target.quaternion.slerpQuaternions(r0, r1, u);
-    const res = solveIK(chain, prev, target, { mode: ikMode, maxIterations: 60 });
+    // Seed with the previous solution advanced toward the taught joints: IK keeps the
+    // seed's null-space component, so redundant/unconstrained joints end where taught.
+    for (let i = 0; i < chain.dof; i++) seed[i] = prev[i] + (qGoal[i] - qStart[i]) / N;
+    const res = solveIK(chain, seed, target, { mode: ikMode, maxIterations: 60 });
     if (!res.converged) {
       throw new PlanError(`MoveL to "${point.name}" is not reachable along a straight line (fails at ${Math.round(u * 100)}%). Use MoveJ or add an intermediate point.`);
     }
@@ -166,7 +184,8 @@ export function planMoveL(robot, chain, fromValues, point, ikMode = 'full') {
       const d = Math.abs(res.q[i] - prev[i]);
       const lim = chain.isAngular[i] ? MOVEL_MAX_JUMP_ANGULAR : MOVEL_MAX_JUMP_LINEAR;
       if (d > lim) {
-        throw new PlanError(`MoveL to "${point.name}" passes through a singularity near ${Math.round(u * 100)}% (${chain.variables[i].name} would jump ${(d * 180 / Math.PI).toFixed(0)}°). Use MoveJ or move the point.`);
+        const amt = chain.isAngular[i] ? `${(d * 180 / Math.PI).toFixed(0)}°` : `${(d * 1000).toFixed(0)} mm`;
+        throw new PlanError(`MoveL to "${point.name}" passes through a singularity near ${Math.round(u * 100)}% (${chain.variables[i].name} would jump ${amt}). Use MoveJ or move the point.`);
       }
       maxRate = Math.max(maxRate, d / chain.velocity[i]);
     }
@@ -176,17 +195,21 @@ export function planMoveL(robot, chain, fromValues, point, ikMode = 'full') {
 
   // Finish exactly on the taught joints when IK ended in the same configuration
   // (it only matches the pose to tolerance, which would otherwise drift taught points).
+  // qGoal satisfies the u = 1 target exactly, so snapping is safe whenever it is within one step.
   const lastQ = samples[samples.length - 1];
-  const qGoalClamped = chain.clamp(Float64Array.from(qGoal));
   let sameBranch = true;
-  for (let i = 0; i < lastQ.length; i++) if (Math.abs(lastQ[i] - qGoalClamped[i]) > 0.05) sameBranch = false;
-  if (sameBranch && samples.length > 1) samples[samples.length - 1] = qGoalClamped;
+  for (let i = 0; i < lastQ.length; i++) {
+    if (Math.abs(lastQ[i] - qGoal[i]) > (chain.isAngular[i] ? MOVEL_MAX_JUMP_ANGULAR : MOVEL_MAX_JUMP_LINEAR)) sameBranch = false;
+  }
+  if (sameBranch && samples.length > 1) samples[samples.length - 1] = Float64Array.from(qGoal);
 
   const v = Math.max(1, point.speed) / 1000; // mm/s -> m/s
   let T = PEAK * Math.max(dist / v, angle / MOVEL_ANGULAR_SPEED);
   // Respect joint velocity limits (conservative: peak timing applied everywhere).
   T = Math.max(T, PEAK * N * maxRate);
-  if (dist < 1e-7 && angle < 1e-7) T = 0;
+  let chainMoves = false;
+  for (let i = 0; i < chain.dof; i++) if (Math.abs(qGoal[i] - qStart[i]) > 1e-9) chainMoves = true;
+  if (dist < 1e-7 && angle < 1e-7 && !chainMoves) T = 0;
 
   const otherStart = others.map((j) => fromValues[j.name] ?? 0);
   const otherGoal = others.map((j, i) => (Number.isFinite(point.joints[j.name]) ? point.joints[j.name] : otherStart[i]));

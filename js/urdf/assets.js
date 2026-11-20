@@ -52,17 +52,41 @@ export function extname(p) {
  *   http(s)://...         -> { scheme: 'http', url }
  *   meshes/x.stl          -> { scheme: 'relative', path: 'meshes/x.stl' }
  */
+/** decodeURIComponent that never throws (a literal % stays as is). */
+export function safeDecode(s) {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
 export function parseRef(ref) {
-  const s = String(ref).trim();
+  const s = String(ref).trim().replace(/\\/g, '/');
   let m = /^(package|model):\/\/([^/]*)\/?(.*)$/i.exec(s);
   if (m) return { scheme: m[1].toLowerCase(), pkg: m[2], path: normalizePath(m[3]) };
   m = /^file:\/\/(.*)$/i.exec(s);
   if (m) {
     // file:///C:/x/y.stl or file:///home/x/y.stl
-    return { scheme: 'file', path: normalizePath(decodeURIComponent(m[1]).replace(/^\/([a-zA-Z]:)/, '$1')) };
+    return { scheme: 'file', path: normalizePath(safeDecode(m[1]).replace(/^\/([a-zA-Z]:)/, '$1')) };
   }
+  // Windows drive or UNC path (xacro $(find ...) output on Windows).
+  if (/^[a-zA-Z]:\//.test(s) || s.startsWith('//')) return { scheme: 'file', path: normalizePath(s) };
   if (/^(https?|blob|data):/i.test(s)) return { scheme: 'http', url: s };
-  return { scheme: 'relative', path: s.replace(/\\/g, '/') };
+  // Absolute POSIX path (xacro $(find ...) output) or a site-absolute URL path.
+  if (s.startsWith('/')) return { scheme: 'absolute', path: normalizePath(s) };
+  return { scheme: 'relative', path: s };
+}
+
+/** Candidate URLs for the trailing 1..4 segments of a local path, relative to the URDF. */
+function tailCandidates(path, u) {
+  const segs = path.split('/');
+  const out = [];
+  for (let k = Math.min(4, segs.length); k >= 1; k--) {
+    const tail = segs.slice(-k).join('/');
+    out.push(new URL('../' + tail, u).href, new URL(tail, u).href);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +103,12 @@ export class UrlResolver {
   }
 
   candidates(ref) {
+    const u = this.urdfUrl;
+    // Never "find" the URDF itself or a directory.
+    return this._candidates(ref).filter((c) => c !== u && !c.endsWith('/'));
+  }
+
+  _candidates(ref) {
     const r = parseRef(ref);
     const u = this.urdfUrl;
     switch (r.scheme) {
@@ -86,8 +116,11 @@ export class UrlResolver {
         return [r.url];
       case 'relative':
         return [new URL(r.path, u).href];
+      case 'absolute':
+        return [...new Set([new URL('/' + r.path, u).href, ...tailCandidates(r.path, u)])];
       case 'package':
       case 'model': {
+        if (!r.path) return [];
         const out = [];
         if (this.packages[r.pkg]) out.push(new URL(r.path, ensureSlash(new URL(this.packages[r.pkg], u).href)).href);
         // URL contains /<pkg>/ -> package root is there.
@@ -104,13 +137,7 @@ export class UrlResolver {
       }
       case 'file': {
         // Absolute local paths cannot be fetched; try the trailing segments relative to the URDF.
-        const segs = r.path.split('/');
-        const out = [];
-        for (let k = Math.min(4, segs.length); k >= 1; k--) {
-          const tail = segs.slice(-k).join('/');
-          out.push(new URL('../' + tail, u).href, new URL(tail, u).href);
-        }
-        return [...new Set(out)];
+        return [...new Set(tailCandidates(r.path, u))];
       }
       default:
         return [];
@@ -164,13 +191,26 @@ export class FileResolver {
     this.urdfDir = dirname(urdfPath);
     this.objectUrls = new Map(); // entry path -> blob URL
     this.cache = new Map();
+    /** ref -> path of a file used only because its name matched (a directory differed). */
+    this.approximate = new Map();
   }
 
   /** Best entry whose path ends with the most trailing segments of `path` (case-insensitive). */
   suffixMatch(path, pkg) {
+    const m = this.suffixMatchInfo(path, pkg);
+    return m ? m.entry : null;
+  }
+
+  /**
+   * Like suffixMatch, plus `approx`: true when a directory segment of the reference
+   * conflicts with the chosen file's directory (e.g. m710ic45m/visual vs m710ic50/visual),
+   * i.e. the file matched by name only. Flat uploads and renamed package roots are not flagged.
+   */
+  suffixMatchInfo(path, pkg) {
     const target = normalizePath(path).toLowerCase().split('/');
     if (!target.length || !target[target.length - 1]) return null;
     let best = null;
+    let bestK = 0;
     let bestScore = 0;
     for (const e of this.entries) {
       const segs = e.path.toLowerCase().split('/');
@@ -184,30 +224,48 @@ export class FileResolver {
       if (score > bestScore) {
         bestScore = score;
         best = e;
+        bestK = k;
       }
     }
-    return best;
+    if (!best) return null;
+    const segs = best.path.split('/');
+    const tIdx = target.length - 1 - bestK;
+    const eIdx = segs.length - 1 - bestK;
+    const approx = tIdx >= 0 && eIdx >= 0 && (!pkg || tIdx > 0);
+    return { entry: best, approx };
   }
 
   /** Resolve a reference to an entry. `fromDir` is the directory relative references start from. */
   resolveEntry(ref, fromDir = this.urdfDir) {
     const key = `${fromDir}|${ref}`;
     if (this.cache.has(key)) return this.cache.get(key);
-    const r = parseRef(ref);
-    let entry = null;
-    if (r.scheme === 'relative') {
-      const joined = normalizePath((fromDir ? fromDir + '/' : '') + r.path);
-      entry = this.byPath.get(joined) || this.byLower.get(joined.toLowerCase()) || this.suffixMatch(r.path);
-    } else if (r.scheme === 'package' || r.scheme === 'model') {
-      const full = normalizePath(`${r.pkg}/${r.path}`);
-      entry = this.byPath.get(full) || this.suffixMatch(full, r.pkg);
-    } else if (r.scheme === 'file') {
-      entry = this.suffixMatch(r.path);
-    } else if (r.scheme === 'http') {
-      entry = this.suffixMatch(r.url.split(/[?#]/)[0].replace(/^[a-z]+:\/\/[^/]*/i, ''));
-    }
+    let entry = this._resolve(ref, ref, fromDir);
+    // URDF/COLLADA references are URIs: retry percent-decoded (raw first, so a real '%' in a name still matches).
+    if (!entry && ref.includes('%')) entry = this._resolve(safeDecode(ref), ref, fromDir);
     this.cache.set(key, entry);
     return entry;
+  }
+
+  _resolve(ref, origRef, fromDir) {
+    const r = parseRef(ref);
+    const viaSuffix = (path, pkg) => {
+      const m = this.suffixMatchInfo(path, pkg);
+      if (!m) return null;
+      if (m.approx) this.approximate.set(origRef, m.entry.path);
+      return m.entry;
+    };
+    if (r.scheme === 'relative') {
+      const joined = normalizePath((fromDir ? fromDir + '/' : '') + r.path);
+      return this.byPath.get(joined) || this.byLower.get(joined.toLowerCase()) || viaSuffix(r.path);
+    }
+    if (r.scheme === 'package' || r.scheme === 'model') {
+      if (!r.path) return null;
+      const full = normalizePath(`${r.pkg}/${r.path}`);
+      return this.byPath.get(full) || viaSuffix(full, r.pkg);
+    }
+    if (r.scheme === 'file' || r.scheme === 'absolute') return viaSuffix(r.path);
+    if (r.scheme === 'http') return viaSuffix(r.url.split(/[?#]/)[0].replace(/^[a-z]+:\/\/[^/]*/i, ''));
+    return null;
   }
 
   async fetch(ref, fromDir) {
@@ -229,9 +287,10 @@ export class FileResolver {
   /** LoadingManager URL modifier: map vfs:/dir/file.png (textures inside meshes) to blob URLs. */
   modifyUrl(url) {
     if (url.startsWith(VFS)) {
-      const rest = url.slice(VFS.length);
-      // rest = "<meshdir>/<texture ref>" where the texture ref itself may be absolute or a URL.
-      const e = this.byPath.get(normalizePath(rest)) || this.byLower.get(normalizePath(rest).toLowerCase()) || this.suffixMatch(rest);
+      const raw = url.slice(VFS.length);
+      // "<meshdir>/<texture ref>" where the texture ref itself may be absolute or a URL.
+      const find = (rest) => this.byPath.get(normalizePath(rest)) || this.byLower.get(normalizePath(rest).toLowerCase()) || this.suffixMatch(rest);
+      const e = find(raw) || (raw.includes('%') ? find(safeDecode(raw)) : null);
       if (e) return this.objectUrl(e);
       return 'data:,missing';
     }
